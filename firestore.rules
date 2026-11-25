@@ -1,0 +1,130 @@
+rules_version = '2';
+
+// =========================================================
+//   AMIGO DOCE - regras de segurança do Firestore
+//   Cole este arquivo inteiro em: Firestore Database -> Regras -> Publicar
+//
+//   - Qualquer um vê só o "placar" público (quem já tirou / quem falta).
+//   - Quem tirou quem (e os e-mails) só o organizador vê (login com a senha).
+//   - Um sorteio só é aceito se a conta da roleta estiver certa:
+//     ninguém consegue "escolher" o resultado mexendo no código do site.
+//   - Cada e-mail só pode ser usado uma vez.
+// =========================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function admin() {
+      return request.auth != null
+        && request.auth.token.email == 'admin@amigo-doce.app';
+    }
+
+    function caminhoPublico() {
+      return /databases/$(database)/documents/sorteio/publico;
+    }
+    function caminhoPar(pessoa) {
+      return /databases/$(database)/documents/pares/$(pessoa);
+    }
+    function caminhoEmail(email) {
+      return /databases/$(database)/documents/emails/$(email);
+    }
+
+    // Candidatos: quem ainda não foi tirado, sem a própria pessoa,
+    // com a regra anti-travamento (2 faltando).
+    function candidatos(antes, pessoa) {
+      let faltam = antes.participantes.removeAll(antes.jaTiraram);
+      let livres = antes.participantes.removeAll(antes.jaTirados).removeAll([pessoa]);
+      let outra = faltam.removeAll([pessoa]);
+      return (faltam.size() == 2 && outra.size() == 1 && outra[0] in livres) ? outra : livres;
+    }
+
+    function casaCerta(antes, p) {
+      let d = p.digitos;
+      let numero = [0, 50][d[0] % 2] + d[1] * 5 + [0, 0, 1, 1, 2, 2, 3, 3, 4, 4][d[2]];
+      let ordem = ((antes.jaTiraram.size() + 1) % 5) * 4;
+      let mare = p.mareQ % 20;
+      return p.casa == (numero + ordem + mare) % 100;
+    }
+
+    function parCerto(antes, p, pessoa) {
+      let d = p.digitos;
+      let cands = candidatos(antes, pessoa);
+      let k = cands.size();
+      return p.keys().hasOnly(['quemTirou', 'tirou', 'numero', 'digitos', 'email', 'ordem',
+                               'mareQ', 'casa', 'indice', 'data'])
+        && p.keys().hasAll(['quemTirou', 'tirou', 'numero', 'digitos', 'email', 'ordem',
+                            'mareQ', 'casa', 'indice', 'data'])
+        && p.quemTirou == pessoa
+        && p.numero is string && p.numero.matches('[0-9]{5}')
+        && d is list && d.size() == 5
+        && string(d[0]) + string(d[1]) + string(d[2]) + string(d[3]) + string(d[4]) == p.numero
+        && p.mareQ is int && p.casa is int && p.indice is int && p.ordem is int
+        && p.mareQ * 5 <= antes.somaMare + 2 && antes.somaMare + 2 < p.mareQ * 5 + 5
+        && casaCerta(antes, p)
+        && k > 0
+        && p.indice >= 0 && p.indice < k
+        && p.indice * 100 <= p.casa * k && p.casa * k < (p.indice + 1) * 100
+        && p.tirou == cands[p.indice]
+        && p.ordem == antes.jaTiraram.size() + 1
+        && p.email is string && p.email.size() <= 100 && p.email == p.email.lower()
+        && p.email.matches('[^@ /]+@[^@ /]+[.][^@ /]+')
+        && p.data is string && p.data.size() <= 40;
+    }
+
+    function publicoCerto(antes, depois, p, pessoa) {
+      let d = p.digitos;
+      return depois.keys().hasOnly(['participantes', 'jaTiraram', 'jaTirados', 'somaMare', 'criadoEm'])
+        && depois.participantes == antes.participantes
+        && depois.criadoEm == antes.criadoEm
+        && depois.jaTiraram == antes.jaTiraram.concat([pessoa])
+        && depois.jaTirados.size() == antes.jaTirados.size() + 1
+        && depois.jaTirados.toSet() == antes.jaTirados.toSet().union([p.tirou].toSet())
+        && depois.somaMare == antes.somaMare + d[3] + d[4];
+    }
+
+    // Um sorteio completo feito por alguém (não organizador):
+    // publico + pares/{pessoa} + emails/{email}, gravados juntos.
+    function sorteioCerto(pessoa) {
+      let antes = get(caminhoPublico()).data;
+      let depois = getAfter(caminhoPublico()).data;
+      let p = getAfter(caminhoPar(pessoa)).data;
+      return pessoa in antes.participantes
+        && !(pessoa in antes.jaTiraram)
+        && parCerto(antes, p, pessoa)
+        && publicoCerto(antes, depois, p, pessoa)
+        && !exists(caminhoEmail(p.email))
+        && existsAfter(caminhoEmail(p.email));
+    }
+
+    function ultimoQueTirou() {
+      let lista = getAfter(caminhoPublico()).data.jaTiraram;
+      return lista[lista.size() - 1];
+    }
+
+    match /sorteio/publico {
+      allow read: if true;
+      allow create, delete: if admin();
+      allow update: if admin()
+        || sorteioCerto(request.resource.data.jaTiraram[resource.data.jaTiraram.size()]);
+    }
+
+    match /pares/{pessoa} {
+      allow read, update, delete: if admin();
+      allow create: if admin() || sorteioCerto(pessoa);
+    }
+
+    match /emails/{email} {
+      allow get: if true;
+      allow list, update, delete: if admin();
+      allow create: if admin()
+        || (request.resource.data.keys().hasOnly(['usado'])
+            && request.resource.data.usado == true
+            && getAfter(caminhoPar(ultimoQueTirou())).data.email == email
+            && sorteioCerto(ultimoQueTirou()));
+    }
+
+    match /{qualquer=**} {
+      allow read, write: if false;
+    }
+  }
+}
